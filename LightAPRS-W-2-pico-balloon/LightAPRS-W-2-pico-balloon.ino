@@ -14,7 +14,8 @@
 #include <JTEncode.h>                       //https://github.com/etherkit/JTEncode (JT65/JT9/JT4/FT8/WSPR/FSQ Encoder Library)
 #include <TimeLib.h>                        //https://github.com/PaulStoffregen/Time
 #include <Adafruit_ZeroTimer.h>             //https://github.com/adafruit/Adafruit_ZeroTimer
-#include <MemoryFree.h>;
+#include <MemoryFree.h>
+#include <Adafruit_BME280.h>
 
 #define Si5351Pwr     A3
 #define TCXO_Pwr      A4
@@ -24,6 +25,9 @@
 #define Si446x_nIRQ   9
 #define Si446x_SDN    4
 #define Si446x_nSEL   8
+#define BmePwr        A1
+#define BaroinHg      30.05
+#define SEALEVELPRESSURE_HPA (BaroinHg / 0.02952998597817832)
 
 //macros
 #define Si5351ON    digitalWrite(Si5351Pwr, HIGH)//NPN
@@ -36,24 +40,31 @@
 #define Si4463OFF   digitalWrite(Si446x_SDN, HIGH)
 #define TcxoON      digitalWrite(TCXO_Pwr, HIGH)
 #define TcxoOFF     digitalWrite(TCXO_Pwr, LOW)
+#define BmeON       digitalWrite(BmePwr, HIGH)
+#define BmeOFF      digitalWrite(BmePwr, LOW)
 
-//#define DEVMODE // Development mode. Uncomment to enable for debugging.
+#define DEVMODE // Development mode. Uncomment to enable for debugging.
 
 //******************************  APRS CONFIG **********************************
-char    CallSign[7]="NOCALL";//DO NOT FORGET TO CHANGE YOUR CALLSIGN
+char    CallSign[7]="KW9D";//DO NOT FORGET TO CHANGE YOUR CALLSIGN
 int8_t  CallNumber=11; //11; //SSID http://www.aprs.org/aprs11/SSIDs.txt
 char    Symbol='O'; // 'O' for balloon, '>' for car, for more info : http://www.aprs.org/symbols/symbols-new.txt
 bool    alternateSymbolTable = false ; //false = '/' , true = '\'
 
-char    comment[50] = "LightAPRS-W 2.0";// Max 50 char
-char    StatusMessage[50] = "LightAPRS-W 2.0 by TA2NHP & TA2MUN";
+char    comment[50] = "#BalloonName";// Max 50 char
+char    StatusMessage[50] = "Bloomington IL School Name";
 
 uint32_t GEOFENCE_APRS_frequency      = 144390000 ;//default frequency before geofencing. This variable will be updated based on GPS location.
 int32_t APRS_Freq_Correction          = -1200;     //Hz. vctcxo frequency correction for si4463
 
+uint32_t FoxhuntFreq=146580000; //frequency to start transmitting on after we descend for foxhunting
+static uint16_t foxhuntAlt=2000; //altitude in ft to turn on the foxhunting beacon on descent
+uint16_t flyAlt=10000; //altitude in ft we must exceed to trigger foxhunt mode on descent
+
 //*****************************************************************************
 
 uint16_t  BeaconWait=50;  //seconds sleep for next beacon (HF or VHF). This is an optimized value, do not change this if possible.
+static uint8_t BeaconSecs = 20;  //time between status message beacons when we have no GPS lock
 uint16_t  BattWait=60;    //seconds sleep if super capacitors/batteries are below BattMin (important if power source is solar panel) 
 float     BattMin=3.3;    // min Volts to wake up.
 float     GpsMinVolt=4.5; //min Volts for GPS to wake up. (important if power source is solar panel) 
@@ -62,14 +73,15 @@ float     HighVolt=6.0; //GPS is always on if the voltage exceeds this value to 
 
 //******************************  HF (WSPR) CONFIG *************************************
 
-char hf_call[7] = "NOCALL";// DO NOT FORGET TO CHANGE YOUR CALLSIGN
+char hf_call[7] = "KW9D";  // DO NOT FORGET TO CHANGE YOUR CALLSIGN
+bool hf_enabled = false ;  // Enable/disable HF transmit
 
 //#define WSPR_DEFAULT_FREQ       10140200UL //30m band
-#define WSPR_DEFAULT_FREQ       14097100UL //20m band
+//#define WSPR_DEFAULT_FREQ       14097100UL //20m band
 //#define WSPR_DEFAULT_FREQ       18106100UL //17M band
 //#define WSPR_DEFAULT_FREQ       21096100UL //15m band
 //#define WSPR_DEFAULT_FREQ       24926100UL //12M band
-//#define WSPR_DEFAULT_FREQ       28126100UL //10m band
+#define WSPR_DEFAULT_FREQ       28126100UL //10m band
 //for all bands -> http://wsprnet.org/drupal/node/7352
 
 
@@ -101,16 +113,23 @@ Due to their extended transmit range due to elevation, multiple digipeater hops 
 Multi-hop paths just add needless congestion on the shared APRS channel in areas hundreds of miles away from the aircraft's own location.  
 NEVER use WIDE1-1 in an airborne path, since this can potentially trigger hundreds of home stations simultaneously over a radius of 150-200 miles. 
  */
-uint8_t pathSize=2; // 2 for WIDE1-N,WIDE2-N ; 1 for WIDE2-N
+uint8_t pathSize=1; // 2 for WIDE1-N,WIDE2-N ; 1 for WIDE2-N
 boolean autoPathSizeHighAlt = true; //force path to WIDE2-N only for high altitude (airborne) beaconing (over 1.000 meters (3.280 feet)) 
 boolean beaconViaARISS = true; //there are no iGates in some regions (such as North Africa,  Oceans, etc) so try to beacon via ARISS (International Space Station) https://www.amsat.org/amateur-radio-on-the-iss/
 
+boolean gpsLock = false; //Keep track if we have a valid GPS lock or not
+unsigned long aliveBeacon = 70000;
+float tempAltitude = 0; //store the current loop altitude for calculating foxhunting
+bool flyAltReached = false; //did we exceed the flyAlt or not?
+bool foxactive = false; //did we fall below alt and need to do foxhunt transmissions
+
 // Send aprs high precision position extension (adds 5 bytes to beacon messaage)
 boolean send_aprs_enhanced_precision = true;
-boolean  aliveStatus = true; //for tx status message on first wake-up just once.
+boolean aliveStatus = true; //for tx status message on first wake-up just once.
 boolean radioSetup = false; //do not change this, temp value
 static char telemetry_buff[100];// telemetry buffer
 uint16_t TxCount = 1; //increase +1 after every APRS transmission
+uint16_t SxCount = 1; //increase +1 after every APRS status transmission
 
 //*******************************************************************************
 
@@ -169,6 +188,8 @@ JTEncode jtencode;
 Si4463 si4463(Si446x_nIRQ, Si446x_SDN, Si446x_nSEL);
 Adafruit_ZeroTimer zerotimer = Adafruit_ZeroTimer(3);
 
+Adafruit_BME280 bme; 
+int bmeAddress = 0x76;
 
 void setup() {
   Watchdog.enable(30000);
@@ -182,12 +203,14 @@ void setup() {
   pinMode(GpsPwr, OUTPUT);
   pinMode(BattPin, INPUT);
   pinMode(Si446x_SDN, OUTPUT);
-  
+  pinMode(BmePwr, OUTPUT);
+
   GpsOFF;
   Si5351OFF;  
   PttOFF;
   Si4463OFF;
   TcxoOFF;
+  BmeON;
 
   Serial.begin(9600);//GPS
   SerialUSB.begin(115200);
@@ -203,16 +226,20 @@ void setup() {
 
   APRS_init();
   APRS_setCallsign(CallSign, CallNumber);
-  APRS_setDestination("APLIGA", 0);
-  APRS_setPath1("WIDE1", Wide1);
-  APRS_setPath2("WIDE2", Wide2);
-  APRS_setPathSize(2);
+  char destination[] = "APLIGA";
+  APRS_setDestination(destination, 0);
+  char wide1[] = "WIDE1";
+  APRS_setPath1(wide1, Wide1);
+  char wide2[] = "WIDE2";
+  APRS_setPath2(wide2, Wide2);
+  APRS_setPathSize(pathSize);
   APRS_useAlternateSymbolTable(alternateSymbolTable);
   APRS_setSymbol(Symbol);
   APRS_setPathSize(pathSize);
 
   Wire.begin();
   bmp.begin();
+  bme.begin(bmeAddress);
 
   SerialUSB.println(F(""));
   SerialUSB.print(F("APRS (VHF) CallSign: "));
@@ -224,78 +251,104 @@ void setup() {
   SerialUSB.println(hf_call);
   SerialUSB.println(F(""));
   
+  //flyAltReached = true;
 }
 
 void loop() {
   Watchdog.reset();
 
 
-if (((readBatt() > BattMin) && GpsFirstFix) || ((readBatt() > GpsMinVolt) && !GpsFirstFix)) {
+  //if (((readBatt() > BattMin) && GpsFirstFix) || ((readBatt() > GpsMinVolt) && !GpsFirstFix)) {
 
-    if (aliveStatus) {
+    // if (aliveStatus) {
 
-      sendStatus();	  
-      aliveStatus = false;
+    //   sendStatus();	  
+    //   aliveStatus = false;
 
-      while (readBatt() < BattMin) {
-        sleepSeconds(BattWait); 
-      }   
-    }
+    //   while (readBatt() < BattMin) {
+    //     sleepSeconds(BattWait); 
+    //   }   
+    // }
     
-      updateGpsData(1000);
-      gpsDebug();
+    updateGpsData(1000);
+    gpsDebug();
 
-      if(gps.location.isValid() && gps.location.age()<1000){
-        GpsInvalidTime=0;
-      }else{
-        GpsInvalidTime++;
-        if(GpsInvalidTime > GpsResetTime){
-          GpsOFF; 
-          ublox_high_alt_mode_enabled = false; //gps sleep mode resets high altitude mode.
-          Watchdog.reset();
-          delay(1000);
-          GpsON;
-          GpsInvalidTime=0;     
-        }
+    if(gps.location.isValid() && gps.location.age()<1000){
+      GpsInvalidTime=0;
+    }else{
+      GpsInvalidTime++;
+      if(GpsInvalidTime > GpsResetTime){
+        GpsOFF; 
+        ublox_high_alt_mode_enabled = false; //gps sleep mode resets high altitude mode.
+        Watchdog.reset();
+        delay(1000);
+        GpsON;
+        GpsInvalidTime=0;     
       }
+    }
 
-      if ((gps.location.age() < 1000 || gps.location.isUpdated()) && gps.location.isValid()) {
-        if (gps.satellites.isValid() && gps.satellites.value() > 3) {
-          GpsFirstFix = true;
-          if(readBatt() < HighVolt){
-             GpsOFF; 
-             ublox_high_alt_mode_enabled = false; //gps sleep mode resets high altitude mode.
-          }      
-          GpsInvalidTime=0;
+    if ((gps.location.age() < 1000 || gps.location.isUpdated()) && gps.location.isValid()) {
+      if (gps.satellites.isValid() && gps.satellites.value() > 3) {
+        if (!gpsLock) {
+          sendStatus(StatusMessage);	
+          gpsLock = true;
+        }
+        aliveBeacon = millis();
 
-          // Checks if there is an HF (WSPR) TX window is soon, if not then send APRS beacon
-          if (!((minute() % 10 == 3 || minute() % 10 == 7) &&  second()>50 && readBatt() > WsprBattMin && timeStatus() == timeSet)){
-             updateTelemetry();
-            //APRS frequency isn't the same for the whole world. (for pico balloon only)
-            if (!radioSetup || TxCount == 200) {
-              configureFreqbyLocation();
-            }
+        GpsFirstFix = true;
+        // if(readBatt() < HighVolt){
+        //     GpsOFF; 
+        //     ublox_high_alt_mode_enabled = false; //gps sleep mode resets high altitude mode.
+        // }      
+        GpsInvalidTime=0;
+        tempAltitude = gps.altitude.feet();
+        if(!flyAltReached && tempAltitude > flyAlt && (bme.readAltitude(SEALEVELPRESSURE_HPA) * 3.2808399) > flyAlt)
+        { 
+          //Make sure GPS and BME pressure agree we flew above the target altitude. If not we can trigger false flights during initial lock.
+          flyAltReached = true;
+          sendStatus(String("Foxhunt signal will activate below " + String(foxhuntAlt) + "ft on " + FoxhuntFreq + "Mhz").c_str());
+        }
+        if(flyAltReached && tempAltitude < foxhuntAlt && (bme.readAltitude(SEALEVELPRESSURE_HPA) * 3.2808399) < foxhuntAlt)
+        {
+          foxactive = true;
+          sendStatus(String("Foxhunt signal active on " + String(FoxhuntFreq) + "Mhz").c_str());
+        }
 
-            if(!arissModEnabled && autoPathSizeHighAlt && gps.altitude.feet()>3000){
-              //force to use high altitude settings (WIDE2-n)
-              APRS_setPathSize(1);
-            } else {
-              //use default settings  
-              APRS_setPathSize(pathSize);
-            }
+        // Checks if there is an HF (WSPR) TX window is soon, if not then send APRS beacon
+        if (!((minute() % 10 == 3 || minute() % 10 == 7) &&  second()>50 && readBatt() > WsprBattMin && timeStatus() == timeSet)){
+            updateTelemetry();
+          //APRS frequency isn't the same for the whole world. (for pico balloon only)
+          if (!radioSetup || TxCount == 200) {
+            configureFreqbyLocation();
+          }
 
-            //in some countries Airborne APRS is not allowed. (for pico balloon only)
-            if (isAirborneAPRSAllowed()) {
-              sendLocation();             
+          if(!arissModEnabled && autoPathSizeHighAlt && tempAltitude>3000){
+            //force to use high altitude settings (WIDE2-n)
+            APRS_setPathSize(1);
+          } else {
+            //use default settings  
+            APRS_setPathSize(pathSize);
+          }
 
-            }
-            freeMem();
-            SerialUSB.flush();
+          //in some countries Airborne APRS is not allowed. (for pico balloon only)
+          // if (isAirborneAPRSAllowed()) {
+            sendLocation();             
 
-          }   
+          // }
+          freeMem();
+          SerialUSB.flush();
 
+        }   
+
+        if(foxactive) {
+#if defined(DEVMODE)  
+          SerialUSB.println(F("Sending FoxHunt"));
+#endif 
+          sendFoxhunt(BeaconWait);
+        }
+        else {
           // preparations for HF starts one minute before TX time at minute 3, 7, 13, 17, 23, 27, 33, 37, 43, 47, 53 or 57. No APRS TX during this period...
-          if (readBatt() > WsprBattMin && timeStatus() == timeSet && ((minute() % 10 == 3) || (minute() % 10 == 7)) ) { 
+          if (readBatt() > WsprBattMin && timeStatus() == timeSet && (minute() % 10 == 0)) { 
             GridLocator(hf_loc, gps.location.lat(), gps.location.lng());
             sprintf(hf_message,"%s %s",hf_call,hf_loc);
             
@@ -305,35 +358,53 @@ if (((readBatt() > BattMin) && GpsFirstFix) || ((readBatt() > GpsMinVolt) && !Gp
             SerialUSB.println(hf_loc);
             #endif
             
-            //HF transmission starts at minute 4, 8, 14, 18, 24, 28, 34, 38, 44, 48, 54 or 58 
-            while (((minute() % 10 != 4) || (minute() % 10 != 8)) && second() != 0) {
-              Watchdog.reset();
-              delay(1);
-            }
-            #if defined(DEVMODE)
-            SerialUSB.println(F("Digital HF Mode Sending..."));
-            #endif          
-            encode();
-            //HFSent=true;
+            // //HF transmission starts at minute 4, 8, 14, 18, 24, 28, 34, 38, 44, 48, 54 or 58 
+            // while (((minute() % 10 != 4) || (minute() % 10 != 8)) && second() != 0) {
+            //   Watchdog.reset();
+            //   delay(1);
+            // }
 
-            #if defined(DEVMODE)
-            SerialUSB.println(F("Digital HF Mode Sent"));
-            #endif             
-  
+            if (hf_enabled) {
+              #if defined(DEVMODE)
+              SerialUSB.println(F("Digital HF Mode Sending..."));
+              #endif
+              encode();
+              //HFSent=true;
+              #if defined(DEVMODE)
+              SerialUSB.println(F("Digital HF Mode Sent"));
+              #endif 
+            } else {
+              SerialUSB.println(F("Digital HF Mode Disabled"));
+              sleepSeconds(20);
+            }
+            char msg[100];
+            sprintf(msg, "%s %s", hf_loc, StatusMessage);
+            sendStatus(msg); // Send status message instead
+            sleepSeconds(20);
+
           } else {
-            sleepSeconds(BeaconWait);
-          }   
-        }else {
-          #if defined(DEVMODE)
-          SerialUSB.println(F("Not enough sattelites"));
-          #endif
+
+  #if defined(DEVMODE)  
+            SerialUSB.println(F("Sleeping after location sent"));
+  #endif         
+            sleepSeconds(BeaconWait);       
+          }
         }
+
+      } else {
+        #if defined(DEVMODE)
+        SerialUSB.println(F("Not enough satellites"));
+        #endif
+        noGpsLockStatus();
       }
+    } else {
+      noGpsLockStatus();
+    }
 
     
-  } else {
-    sleepSeconds(BattWait);
-  }
+  // } else {
+  //   sleepSeconds(BattWait);
+  // }
 }
 
 void sleepSeconds(int sec) {
@@ -344,10 +415,10 @@ void sleepSeconds(int sec) {
   SerialUSB.flush();
   for (int i = 0; i < sec; i++) {
     if (GpsFirstFix){//sleep gps after first fix
-      if (readBatt() < HighVolt){
-        GpsOFF;
-        ublox_high_alt_mode_enabled = false;
-      }
+      // if (readBatt() < HighVolt){
+      //   GpsOFF;
+      //   ublox_high_alt_mode_enabled = false;
+      // }
     }else{
       if (readBatt() < BattMin){
         GpsOFF;
@@ -398,8 +469,10 @@ void configureFreqbyLocation() {
 
 
   if(beaconViaARISS && inARISSGeoFence(tempLat, tempLong)) {
-    APRS_setPath1("ARISS", Wide1);
-    APRS_setPath2("WIDE2", Wide2);
+    char wide1[] = "WIDE1";
+    APRS_setPath1(wide1, Wide1);
+    char wide2[] = "WIDE2";
+    APRS_setPath2(wide2, Wide2);
     APRS_setPathSize(2);
     GEOFENCE_APRS_frequency=145825000;
     arissModEnabled = true;
@@ -456,7 +529,7 @@ void updateTelemetry() {
   //sprintf(telemetry_buff + 10, "%06lu", (long)gps.altitude.feet());
 
   //fixing negative altitude values causing display bug on aprs.fi
-  float tempAltitude = gps.altitude.feet();
+  tempAltitude = gps.altitude.feet();
 
   if (tempAltitude>0){
     //for positive values
@@ -489,8 +562,27 @@ void updateTelemetry() {
   sprintf(telemetry_buff + 50, "%02d", gps.satellites.isValid() ? (int)gps.satellites.value() : 0);
   telemetry_buff[52] = 'S';
   telemetry_buff[53] = ' ';
-
-  sprintf(telemetry_buff + 54, "%s", comment);   
+  tempC = bme.readTemperature();
+  dtostrf(tempC, 6, 2, telemetry_buff + 54);
+  telemetry_buff[60] = 'C';
+  telemetry_buff[61] = ' '; 
+  pressure = bme.readPressure(); // / 100.0; //Pa to hPa
+  dtostrf(pressure, 8, 1, telemetry_buff + 62);
+  //telemetry_buff[69] = 'h';
+  telemetry_buff[70] = 'P';
+  telemetry_buff[71] = 'a';
+  telemetry_buff[72] = ' ';
+  float humd = bme.readHumidity();
+  dtostrf(humd, 5, 2, telemetry_buff + 73);
+  telemetry_buff[78] = '%';
+  //telemetry_buff[79] = ' '; 
+  if(isnan(humd) || pressure < 0){
+    BmeOFF;
+    delay(100);
+    BmeON;
+    bme.begin(bmeAddress);
+  }
+  //sprintf(telemetry_buff + 54, "%s", comment);   
 
   // APRS PRECISION AND DATUM OPTION http://www.aprs.org/aprs12/datum.txt ; this extension should be added at end of beacon message.
   // We only send this detailed info if it's likely we're interested in, i.e. searching for landing position
@@ -552,7 +644,7 @@ void sendLocation() {
 
 }
 
-void sendStatus() {
+void sendStatus(const char *msg) {
   TcxoON;
   delay(10);
   Si4463ON;
@@ -573,9 +665,17 @@ void sendStatus() {
     si4463.setModemOOK();
     si4463.enterTxMode();
     analogWrite(A0, 128);
+    char status[105];
+    // sprintf(msg, "No GPS Lock: Bat %4.2fv, Time %d-%d-%d %d:%d:%d, %4.0fM, %6.0fPa", readBatt(), gps.date.year(), gps.date.month(), gps.date.day(), gps.time.hour(), gps.time.minute(), gps.time.second(), gps.altitude.meters(), pressure);
+    sprintf(status, "Bat %4.2fv, %dTxC, %dSxC, %02dS ", readBatt(), TxCount, SxCount, gps.satellites.isValid() ? (int)gps.satellites.value() : 0);
+    strcat(status, msg);
+    #if defined(DEVMODE)
+    SerialUSB.println(F("Sending status message:"));
+    SerialUSB.println(status);
+    #endif      
     PttON;
     delay(500);
-    APRS_sendStatus(StatusMessage);
+    APRS_sendStatus(status);
     delay(10);
     PttOFF;
     si4463.enterStandbyMode();
@@ -584,10 +684,75 @@ void sendStatus() {
     SerialUSB.print(F("Status sent (Freq: "));
     SerialUSB.print(GEOFENCE_APRS_frequency);
     SerialUSB.print(F(") - "));
-    SerialUSB.println(TxCount);
-    TxCount++;
+    SerialUSB.println(SxCount);
+    SxCount++;
   }
 
+}
+
+void sendFoxhunt(int secDuration)  {
+  TcxoON;
+  unsigned long start = millis();
+  delay(10);
+  Si4463ON;
+  delay(20);            // wait for si4463 stable
+  if (!si4463.init())
+  {
+    #if defined(DEVMODE)
+    SerialUSB.println("Si4463 init fail!");  
+    #endif  
+    Si4463OFF;
+    TcxoOFF;
+
+  } else {
+    #if defined(DEVMODE)
+    SerialUSB.println("Si4463 Init OK");
+    #endif  
+    si4463.setFrequency(FoxhuntFreq);
+    si4463.setModemOOK();
+    si4463.enterTxMode();
+    analogWrite(A0, 128);
+    PttON;    
+    while (millis() - start < 10000) {
+      APRS_sendLoc(telemetry_buff);
+      delay(100);
+    }
+    PttOFF;
+    si4463.enterStandbyMode();
+    Si4463OFF;
+    TcxoOFF;
+    SerialUSB.print(F("Foxhunt sent (Freq: "));
+    SerialUSB.print(FoxhuntFreq);
+    SerialUSB.print(F(") - "));
+    // SerialUSB.println(SxCount);
+    // SxCount++;
+  }
+
+}
+
+void noGpsLockStatus() {
+  gpsLock = false;
+  float pressure = bme.readPressure();
+  if(pressure<0){  // if pressure falls below 0, something is wrong, attempt to reinit the BME
+#if defined(DEVMODE)  
+    SerialUSB.println(F("Pressure below 0, reinit BME and try again"));
+#endif 
+    BmeOFF;
+    delay(100);
+    BmeON;
+    bme.begin(bmeAddress);
+    pressure = bme.readPressure();
+  }  
+  if (millis() - aliveBeacon > BeaconSecs * 1000) {	
+    char msg[100];
+
+    sprintf(msg, "No GPS Lock: Time %02d-%02d-%02d %02d:%02d:%02d, %4.0fM, %6.0fPa", gps.date.year(), gps.date.month(), gps.date.day(), gps.time.hour(), gps.time.minute(), gps.time.second(), gps.altitude.meters(), pressure);
+    sendStatus(msg);	   	  
+    aliveBeacon = millis();
+  }
+  if(foxactive) {
+    sendFoxhunt(BeaconSecs);
+  }  
 }
 
 static void updateGpsData(int ms)
@@ -612,6 +777,7 @@ static void updateGpsData(int ms)
       char c;
       c=Serial.read();
       gps.encode(c);
+      SerialUSB.print(c);
       bekle= millis();
     }
     
